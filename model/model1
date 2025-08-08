@@ -178,4 +178,7 @@ plt.xlabel('Epoch')
 plt.ylabel('Accuracy')
 plt.legend()
 
-plt.ti
+plt.tight_layout()
+plt.savefig('training_curves.png')
+plt.show()
+
