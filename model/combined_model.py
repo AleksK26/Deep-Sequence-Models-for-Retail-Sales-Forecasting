@@ -14,7 +14,7 @@ import joblib
 import os
 
 class TomatoWeatherDataset(Dataset):
-    """Custom dataset that combines images with weather features"""
+    """Custom dataset that combines images with weather features and days to harvest"""
     
     def __init__(self, csv_file, transform=None, use_weather=True):
         self.data = pd.read_csv(csv_file)
@@ -25,8 +25,16 @@ class TomatoWeatherDataset(Dataset):
         self.class_names = sorted(self.data['stage'].unique())
         self.class_to_idx = {cls: idx for idx, cls in enumerate(self.class_names)}
         
-        # Weather feature columns
-        self.weather_features = [col for col in self.data.columns if col.startswith('weather_')]
+        # Define weather feature columns (based on your dataset)
+        self.weather_features = [
+            'temperature_2m (°C)', 'relative_humidity_2m (%)', 'precipitation (mm)',
+            'soil_temperature_0_to_7cm (°C)', 'soil_temperature_7_to_28cm (°C)',
+            'soil_moisture_0_to_7cm (m³/m³)', 'soil_moisture_7_to_28cm (m³/m³)',
+            'wind_speed_10m (km/h)'
+        ]
+        
+        # Filter only existing columns
+        self.weather_features = [col for col in self.weather_features if col in self.data.columns]
         
         if self.use_weather and len(self.weather_features) > 0:
             # Normalize weather features
@@ -40,6 +48,9 @@ class TomatoWeatherDataset(Dataset):
         else:
             self.weather_normalized = None
             print("⚠️ Not using weather features")
+        
+        # Assume a fixed harvest date (adjust based on variety/climate; ~129 days from start)
+        self.harvest_date = pd.to_datetime('2025-08-01')
     
     def __len__(self):
         return len(self.data)
@@ -56,15 +67,19 @@ class TomatoWeatherDataset(Dataset):
         stage = self.data.iloc[idx]['stage']
         label = self.class_to_idx[stage]
         
+        # Calculate days to harvest
+        date = pd.to_datetime(self.data.iloc[idx]['date'])
+        days_to_harvest = max(0, (self.harvest_date - date).days)
+        
         # Get weather features if available
         if self.use_weather and self.weather_normalized is not None:
             weather = torch.FloatTensor(self.weather_normalized[idx])
-            return image, weather, label
+            return image, weather, label, days_to_harvest
         else:
-            return image, label
+            return image, label, days_to_harvest
 
 class MultiModalTomatoNet(nn.Module):
-    """Neural network that combines CNN for images with MLP for weather data"""
+    """Neural network that combines CNN for images with MLP for weather data, with multi-task outputs"""
     
     def __init__(self, num_classes, num_weather_features=0, use_weather=True):
         super(MultiModalTomatoNet, self).__init__()
@@ -94,21 +109,26 @@ class MultiModalTomatoNet(nn.Module):
                 nn.Dropout(0.2)
             )
             
-            # Combined classifier
+            # Combined features
             combined_features = image_features + 64
         else:
             combined_features = image_features
         
-        # Final classifier
-        self.classifier = nn.Sequential(
+        # Shared layers for combined features
+        self.shared = nn.Sequential(
             nn.Linear(combined_features, 512),
             nn.ReLU(),
             nn.Dropout(0.5),
             nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Dropout(0.3),
-            nn.Linear(256, num_classes)
+            nn.Dropout(0.3)
         )
+        
+        # Classification head (for stage)
+        self.classifier = nn.Linear(256, num_classes)
+        
+        # Regression head (for days to harvest)
+        self.regressor = nn.Linear(256, 1)
     
     def forward(self, image, weather=None):
         # Process image
@@ -122,12 +142,16 @@ class MultiModalTomatoNet(nn.Module):
         else:
             combined = image_features
         
-        # Final classification
-        output = self.classifier(combined)
-        return output
+        # Shared layers
+        shared_out = self.shared(combined)
+        
+        # Outputs
+        class_out = self.classifier(shared_out)
+        reg_out = self.regressor(shared_out)
+        return class_out, reg_out
 
 def train_enhanced_model():
-    """Train the enhanced model with weather integration"""
+    """Train the enhanced model with weather integration and multi-task learning"""
     
     # Configuration
     dataset_csv = "data/tomato_dataset_with_weather.csv"
@@ -188,15 +212,16 @@ def train_enhanced_model():
     print(f"🧠 Model created with {num_weather_features} weather features")
     
     # Training setup
-    criterion = nn.CrossEntropyLoss()
+    criterion_class = nn.CrossEntropyLoss()
+    criterion_reg = nn.MSELoss()
     optimizer = optim.AdamW(model.parameters(), lr=0.001, weight_decay=0.01)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=3, factor=0.5)
     
     # Training loop
     num_epochs = 20
-    best_val_acc = 0.0
-    train_losses, val_losses = [], []
-    train_accs, val_accs = [], []
+    best_val_loss = float('inf')
+    train_class_losses, train_reg_losses, val_class_losses, val_reg_losses = [], [], [], []
+    train_accs, val_accs, val_maes = [], [], []
     
     print("🚀 Starting training...")
     
@@ -206,112 +231,127 @@ def train_enhanced_model():
         
         # Training phase
         model.train()
-        train_loss, train_correct = 0.0, 0
+        train_class_loss, train_reg_loss, train_correct = 0.0, 0.0, 0
         
         for batch in tqdm(train_loader, desc="Training"):
-            if len(batch) == 3:  # Image, weather, label
-                images, weather, labels = batch
-                images, weather, labels = images.to(device), weather.to(device), labels.to(device)
-                outputs = model(images, weather)
-            else:  # Image, label only
-                images, labels = batch
-                images, labels = images.to(device), labels.to(device)
-                outputs = model(images)
+            if len(batch) == 4:  # Image, weather, label, days
+                images, weather, labels, days = batch
+                images, weather, labels, days = images.to(device), weather.to(device), labels.to(device), torch.tensor(days).to(device).float().unsqueeze(1)
+                class_out, reg_out = model(images, weather)
+            else:  # Fallback (no weather)
+                images, labels, days = batch
+                images, labels, days = images.to(device), labels.to(device), torch.tensor(days).to(device).float().unsqueeze(1)
+                class_out, reg_out = model(images)
             
             optimizer.zero_grad()
-            loss = criterion(outputs, labels)
+            loss_class = criterion_class(class_out, labels)
+            loss_reg = criterion_reg(reg_out, days)
+            loss = loss_class + loss_reg  # Equal weight; tune if needed
             loss.backward()
             optimizer.step()
             
-            train_loss += loss.item() * images.size(0)
-            _, preds = torch.max(outputs, 1)
+            train_class_loss += loss_class.item() * images.size(0)
+            train_reg_loss += loss_reg.item() * images.size(0)
+            _, preds = torch.max(class_out, 1)
             train_correct += torch.sum(preds == labels.data)
         
         # Validation phase
         model.eval()
-        val_loss, val_correct = 0.0, 0
+        val_class_loss, val_reg_loss, val_correct, val_mae = 0.0, 0.0, 0, 0.0
         
         with torch.no_grad():
             for batch in tqdm(val_loader, desc="Validating"):
-                if len(batch) == 3:  # Image, weather, label
-                    images, weather, labels = batch
-                    images, weather, labels = images.to(device), weather.to(device), labels.to(device)
-                    outputs = model(images, weather)
-                else:  # Image, label only
-                    images, labels = batch
-                    images, labels = images.to(device), labels.to(device)
-                    outputs = model(images)
+                if len(batch) == 4:  # Image, weather, label, days
+                    images, weather, labels, days = batch
+                    images, weather, labels, days = images.to(device), weather.to(device), labels.to(device), torch.tensor(days).to(device).float().unsqueeze(1)
+                    class_out, reg_out = model(images, weather)
+                else:
+                    images, labels, days = batch
+                    images, labels, days = images.to(device), labels.to(device), torch.tensor(days).to(device).float().unsqueeze(1)
+                    class_out, reg_out = model(images)
                 
-                loss = criterion(outputs, labels)
+                loss_class = criterion_class(class_out, labels)
+                loss_reg = criterion_reg(reg_out, days)
                 
-                val_loss += loss.item() * images.size(0)
-                _, preds = torch.max(outputs, 1)
+                val_class_loss += loss_class.item() * images.size(0)
+                val_reg_loss += loss_reg.item() * images.size(0)
+                _, preds = torch.max(class_out, 1)
                 val_correct += torch.sum(preds == labels.data)
+                val_mae += torch.mean(torch.abs(reg_out - days)).item() * images.size(0)
         
         # Calculate metrics
-        train_loss = train_loss / len(train_dataset)
-        val_loss = val_loss / len(val_dataset)
-        train_acc = train_correct.double() / len(train_dataset)
-        val_acc = val_correct.double() / len(val_dataset)
+        n_train = len(train_dataset)
+        n_val = len(val_dataset)
+        train_class_loss /= n_train
+        train_reg_loss /= n_train
+        val_class_loss /= n_val
+        val_reg_loss /= n_val
+        train_acc = train_correct.double() / n_train
+        val_acc = val_correct.double() / n_val
+        val_mae /= n_val
+        val_total_loss = val_class_loss + val_reg_loss
         
-        train_losses.append(train_loss)
-        val_losses.append(val_loss)
+        train_class_losses.append(train_class_loss)
+        train_reg_losses.append(train_reg_loss)
+        val_class_losses.append(val_class_loss)
+        val_reg_losses.append(val_reg_loss)
         train_accs.append(train_acc.item())
         val_accs.append(val_acc.item())
+        val_maes.append(val_mae)
         
         # Update learning rate
-        scheduler.step(val_loss)
+        scheduler.step(val_total_loss)
         
         # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        if val_total_loss < best_val_loss:
+            best_val_loss = val_total_loss
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'val_acc': val_acc,
+                'val_loss': val_total_loss,
                 'class_names': full_dataset.class_names,
                 'num_classes': len(full_dataset.class_names),
                 'weather_features': full_dataset.weather_features,
                 'use_weather': True
             }, "best_enhanced_model.pth")
-            print(f"💾 Best model saved! Accuracy: {val_acc:.4f}")
+            print(f"💾 Best model saved! Val Loss: {val_total_loss:.4f}")
         
-        print(f"📈 Train Loss: {train_loss:.4f}, Acc: {train_acc:.4f}")
-        print(f"📊 Val Loss: {val_loss:.4f}, Acc: {val_acc:.4f}")
+        print(f"📈 Train Class Loss: {train_class_loss:.4f}, Reg Loss: {train_reg_loss:.4f}, Acc: {train_acc:.4f}")
+        print(f"📊 Val Class Loss: {val_class_loss:.4f}, Reg Loss: {val_reg_loss:.4f}, Acc: {val_acc:.4f}, MAE (days): {val_mae:.4f}")
         print(f"🎯 Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
     
-    print(f"\n✅ Training completed! Best validation accuracy: {best_val_acc:.4f}")
+    print(f"\n✅ Training completed! Best validation loss: {best_val_loss:.4f}")
     
     # Plot training curves
     plt.figure(figsize=(15, 5))
     
     plt.subplot(1, 3, 1)
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Val Loss')
-    plt.title('Training and Validation Loss')
+    plt.plot(train_class_losses, label='Train Class Loss')
+    plt.plot(val_class_losses, label='Val Class Loss')
+    plt.title('Classification Loss')
     plt.xlabel('Epoch')
     plt.ylabel('Loss')
     plt.legend()
     
     plt.subplot(1, 3, 2)
-    plt.plot(train_accs, label='Train Accuracy')
-    plt.plot(val_accs, label='Val Accuracy')
-    plt.title('Training and Validation Accuracy')
+    plt.plot(train_reg_losses, label='Train Reg Loss')
+    plt.plot(val_reg_losses, label='Val Reg Loss')
+    plt.title('Regression Loss (Days to Harvest)')
     plt.xlabel('Epoch')
-    plt.ylabel('Accuracy')
+    plt.ylabel('Loss')
     plt.legend()
     
     plt.subplot(1, 3, 3)
-    # Feature importance could be added here if needed
-    plt.bar(range(len(full_dataset.weather_features)), 
-            np.random.random(len(full_dataset.weather_features)))  # Placeholder
-    plt.title('Weather Feature Usage')
-    plt.xticks(range(len(full_dataset.weather_features)), 
-               [f.replace('weather_', '') for f in full_dataset.weather_features], 
-               rotation=45)
-    plt.tight_layout()
+    plt.plot(train_accs, label='Train Acc')
+    plt.plot(val_accs, label='Val Acc')
+    plt.plot(val_maes, label='Val MAE (days)')
+    plt.title('Accuracy and MAE')
+    plt.xlabel('Epoch')
+    plt.ylabel('Metric')
+    plt.legend()
     
+    plt.tight_layout()
     plt.savefig('enhanced_training_curves.png', dpi=300, bbox_inches='tight')
     plt.show()
 
